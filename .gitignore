@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environment
+.env
+venv/
+env/
+ENV/
+
+# Logs & Data
+*.log
+signals.log
+*.parquet
+data/
+docs/
+
+# Tests coverages dll
+.pytest_cache/
