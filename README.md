@@ -1,4 +1,4 @@
-# QQQ ML Cybernetics Scaffolding
+# Adaptive Control System QQQ
 
 > End-to-end pipeline complete. Mock inference running, delayed feedback queue operational.  
 > Awaiting Phase 0 data accumulation for live model training.

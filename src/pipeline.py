@@ -1,5 +1,10 @@
+"""
+Main pipeline orchestrator for the Adaptive Control System.
+Runs the complete cybernetic scaffolding end-to-end.
+"""
 import pandas as pd
 import numpy as np
+import logging
 
 from src.features.validator import SnapshotValidator
 from src.features.buffer import WindowBuffer
@@ -13,16 +18,32 @@ from src.control.loop import CyberneticLoop
 from src.control.regime import RegimeClassifier
 
 from src.utils.logger import SignalLogger
+from src.utils.config import get_config
+from src.utils.types import FeatureVector
+
+logger = logging.getLogger(__name__)
+
 
 class PipelineOrchestrator:
     """
     Main controller running the complete cybernetic scaffolding end-to-end.
     """
     
-    def __init__(self, target_minutes=5):
+    def __init__(self, target_minutes: int = None):
+        """
+        Initialize the pipeline orchestrator.
+        
+        Args:
+            target_minutes: Override for target_minutes. Uses config if None.
+        """
+        config = get_config()
+        
         # 1. Features & Validation
-        self.validator = SnapshotValidator()
-        self.buffer = WindowBuffer(capacity=5)
+        self.validator = SnapshotValidator(
+            expected_strikes=config.features.expected_strikes,
+            expected_columns=config.features.expected_columns
+        )
+        self.buffer = WindowBuffer(capacity=config.features.buffer_capacity)
         self.builder = FeatureBuilder(self.buffer)
         
         # 2. Models
@@ -30,35 +51,54 @@ class PipelineOrchestrator:
         self.explainer = SHAPExplainerWrapper(self.model)
         
         # 3. Control Loop
-        self.feedback_queue = FeedbackQueue(target_minutes=target_minutes, ttl_minutes=15)
-        # Assuming we know the features we calculate in builder.py
-        feature_names = ['net_gex', 'net_vanna', 'pc_oi_ratio', 'wavg_call_iv', 'max_call_oi_strike', 'max_put_oi_strike', 'delta_gex']
-        self.loop = CyberneticLoop(feature_names=feature_names)
+        self.feedback_queue = FeedbackQueue(
+            target_minutes=target_minutes,
+            ttl_minutes=config.pipeline.ttl_minutes
+        )
+        
+        # Get feature names from builder (not hardcoded!)
+        self._feature_names = self.builder.feature_names
+        self.loop = CyberneticLoop(feature_names=self._feature_names)
         
         # 4. Logger & History
         self.logger = SignalLogger()
-        self.price_history = pd.Series(dtype=float) # Stores atm_strike for resolution
-
+        self.price_history = pd.Series(dtype=float)  # Stores atm_strike for resolution
+        
+        logger.info(
+            f"PipelineOrchestrator initialized: target_minutes={target_minutes or config.pipeline.target_minutes}, "
+            f"buffer_capacity={config.features.buffer_capacity}, "
+            f"features={self._feature_names}"
+        )
+    
+    @property
+    def feature_names(self) -> list:
+        """Return the list of feature names."""
+        return self._feature_names
+    
     def process_snapshot(self, snapshot_df: pd.DataFrame) -> None:
         """
         Executes a single step of the pipeline for a new 1-minute snapshot.
+        
+        Args:
+            snapshot_df: DataFrame containing the snapshot data
         """
         # --- A. Validation ---
-        if not self.validator.validate(snapshot_df):
+        is_valid_data = self.validator.validate(snapshot_df)
+        
+        if not is_valid_data:
             # We don't skip processing entirely if it fails validation,
             # because we still need to process old feedback queue items against the new time.
-            timestamp = pd.Timestamp.now() # Fallback if snapshot corrupt
+            timestamp = pd.Timestamp.now()  # Fallback if snapshot corrupt
             current_price = None
-            is_valid_data = False
+            logger.warning("Snapshot validation failed, using fallback timestamp")
         else:
             # Assumes snapshot is ordered by time, take first row for meta
             timestamp = pd.to_datetime(snapshot_df['timestamp'].iloc[0])
-            is_valid_data = True
-
+        
         # --- B. Retroactive Feedback Processing ---
         if is_valid_data:
             # We use atm_strike as the proxy for current price for resolving prediction errors
-            atm_strike = self.builder._get_atm_strike(snapshot_df) 
+            atm_strike = self.builder.get_atm_strike(snapshot_df)
             self.price_history[timestamp] = atm_strike
             
             # Resolve matured predictions and update PID/Weights
@@ -70,18 +110,29 @@ class PipelineOrchestrator:
             
             if resolved_errors:
                 self.loop.process_feedback(resolved_errors)
+                logger.debug(f"Processed {len(resolved_errors)} resolved errors")
         else:
             # Still process timeouts even if current snapshot is bad
-            self.feedback_queue.process_outcomes(timestamp, 0.0, self.price_history)
-
-
+            # Pass None for price to indicate invalid data
+            self.feedback_queue.process_outcomes(
+                timestamp, 
+                0.0,  # Placeholder - won't be used for resolution
+                self.price_history
+            )
+        
         # --- C. Live Inference & Cybernetic Control ---
         if is_valid_data:
-            # 1. Build Raw Features limit 1300 rows -> 1 row
-            raw_features = self.builder.build_features(snapshot_df)
+            # 1. Build Raw Features (1300 rows -> 1 row)
+            # Note: buffer.add() is called inside build_features by default
+            feature_vector = self.builder.build_features(snapshot_df)
+            raw_features = feature_vector.to_dict()
             
             # 2. Get Regime
-            regime = self.loop.regime_classifier.get_current_regime(timestamp, raw_features)
+            regime_state = self.loop.regime_classifier.get_current_regime(
+                timestamp, 
+                raw_features
+            )
+            regime = regime_state.to_dict()
             
             # 3. Apply Adaptive Weights
             adjusted_features = self.loop.adjust_features(raw_features)
@@ -114,7 +165,26 @@ class PipelineOrchestrator:
                 raw_prediction=raw_prediction,
                 confidence=confidence,
                 regime=regime,
-                current_weights=self.loop.feature_weights
+                current_weights=self.loop.get_weights()
             )
             
-            print(f"[{timestamp}] Signal processed. Conf: {confidence:.2f} | Regime: {regime['time_regime']}/{regime['vol_regime']}")
+            logger.info(
+                f"[{timestamp}] Signal processed. Conf: {confidence:.2f} | "
+                f"Regime: {regime['time_regime']}/{regime['vol_regime']}"
+            )
+    
+    def get_status(self) -> dict:
+        """Get current pipeline status."""
+        return {
+            'queue_size': self.feedback_queue.get_queue_size(),
+            'feature_weights': self.loop.get_weights(),
+            'price_history_len': len(self.price_history)
+        }
+    
+    def reset(self) -> None:
+        """Reset the pipeline for a new trading day."""
+        self.buffer.clear()
+        self.feedback_queue.clear()
+        self.loop.reset_weights()
+        self.price_history = pd.Series(dtype=float)
+        logger.info("Pipeline reset for new trading day")

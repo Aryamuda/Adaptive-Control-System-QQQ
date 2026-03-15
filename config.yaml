@@ -1,0 +1,80 @@
+# Adaptive Control System QQQ - Configuration
+# All hyperparameters centralized for maintainability
+
+pipeline:
+  target_minutes: 5  # N minutes lookahead for prediction
+  ttl_minutes: 15    # Maximum time to wait for prediction resolution
+
+features:
+  buffer_capacity: 5  # Number of snapshots to keep for time-derivative calculations
+  expected_strikes: 120
+  expected_columns:
+    - timestamp
+    - strike
+    - call_bid
+    - call_ask
+    - call_iv
+    - call_delta
+    - call_gamma
+    - call_vega
+    - call_theta
+    - call_rho
+    - call_vanna
+    - call_charm
+    - call_oi
+    - call_volume
+    - put_bid
+    - put_ask
+    - put_iv
+    - put_delta
+    - put_gamma
+    - put_vega
+    - put_theta
+    - put_rho
+    - put_vanna
+    - put_charm
+    - put_oi
+    - put_volume
+
+model:
+  n_estimators: 500
+  max_depth: 5
+  learning_rate: 0.05
+  subsample: 0.8
+  colsample_bytree: 0.8
+  early_stopping_rounds: 50
+  eval_metric: "auc"
+
+control:
+  # PID Controller gains
+  kp: 0.5
+  ki: 0.1
+  kd: 0.0
+  
+  # Learning rate for weight adjustment
+  alpha: 0.05
+  
+  # Weight bounds
+  min_weight: 0.1
+  max_weight: 2.0
+
+labeler:
+  target_minutes: 5
+  threshold: 0.0005  # Minimum log return to classify as Up/Down
+
+feedback:
+  # Validation thresholds
+  max_null_greek_ratio: 0.1
+  max_zero_iv_ratio: 0.1
+  
+  # Vol regime threshold (annualized IV)
+  high_vol_threshold: 0.30
+
+regime:
+  time_regimes:
+    open: "10:30:00"
+    close: "15:00:00"
+
+logging:
+  log_file: "signals.log"
+  level: "INFO"
